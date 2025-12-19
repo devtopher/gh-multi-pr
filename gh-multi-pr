@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# Default values
+DEFAULT_TARGETS="dev,staging,beta,master"
+DRY_RUN=false
+TARGETS=""
+FEATURE_BRANCH=""
+TMP_DIR=""
+
+# Cleanup function
+cleanup() {
+  if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
+    rm -rf "$TMP_DIR"
+  fi
+}
+trap cleanup EXIT
+
+show_help() {
+  cat << EOF
+Usage: gh multi-pr [feature-branch] [options]
+
+Create PRs from a feature branch to multiple target branches.
+If no branch is specified, uses the current branch.
+
+Options:
+  -h, --help     Show this help message
+  -v, --version  Show version number
+  -t, --targets  Comma-separated list of target branches (default: $DEFAULT_TARGETS)
+  -d, --dry-run  Show what would be done without creating PRs
+
+Examples:
+  gh multi-pr                                   # Current branch → all targets
+  gh multi-pr feature/new-login
+  gh multi-pr feature/hotfix --targets staging,master
+  gh multi-pr --dry-run                         # Preview with current branch
+EOF
+}
+
+show_version() {
+  echo "gh-multi-pr version $VERSION"
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+    -v|--version)
+      show_version
+      exit 0
+      ;;
+    -t|--targets)
+      if [ -z "${2:-}" ]; then
+        echo "Error: --targets requires a value"
+        exit 1
+      fi
+      TARGETS="$2"
+      shift 2
+      ;;
+    -d|--dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    -*)
+      echo "Error: Unknown option $1"
+      show_help
+      exit 1
+      ;;
+    *)
+      if [ -z "$FEATURE_BRANCH" ]; then
+        FEATURE_BRANCH="$1"
+      else
+        echo "Error: Unexpected argument '$1'"
+        show_help
+        exit 1
+      fi
+      shift
+      ;;
+  esac
+done
+
+# Check prerequisites
+if ! command -v gh &> /dev/null; then
+  echo "Error: GitHub CLI (gh) is not installed."
+  echo "Install it from: https://cli.github.com/"
+  exit 1
+fi
+
+if ! gh auth status &> /dev/null; then
+  echo "Error: Not authenticated with GitHub CLI."
+  echo "Run: gh auth login"
+  exit 1
+fi
+
+if ! git rev-parse --is-inside-work-tree &> /dev/null; then
+  echo "Error: Not inside a git repository."
+  exit 1
+fi
+
+# Default to current branch if not specified
+if [ -z "$FEATURE_BRANCH" ]; then
+  FEATURE_BRANCH=$(git branch --show-current)
+  if [ -z "$FEATURE_BRANCH" ]; then
+    echo "Error: Could not determine current branch (detached HEAD?)"
+    exit 1
+  fi
+  echo "Using current branch: $FEATURE_BRANCH"
+fi
+
+# Validate feature branch exists
+if ! git rev-parse --verify "$FEATURE_BRANCH" &> /dev/null; then
+  echo "Error: Branch '$FEATURE_BRANCH' does not exist."
+  exit 1
+fi
+
+# Set default targets if not specified
+if [ -z "$TARGETS" ]; then
+  TARGETS="$DEFAULT_TARGETS"
+fi
+
+# Convert comma-separated targets to array
+IFS=',' read -ra TARGET_BRANCHES <<< "$TARGETS"
+
+# Ensure working tree is clean
+if [ -n "$(git status --porcelain)" ]; then
+  echo "Error: Working tree not clean. Commit or stash changes first."
+  exit 1
+fi
+
+# Save current branch
+CURRENT_BRANCH=$(git branch --show-current)
+
+# Extract repo owner/name from origin URL
+REPO_URL=$(git config --get remote.origin.url)
+REPO_NAME=$(echo "$REPO_URL" | sed -E 's#.*/([^/]+)/([^/]+)(\.git)?$#\1/\2#' | sed 's/\.git$//')
+
+if $DRY_RUN; then
+  echo "=== DRY RUN MODE ==="
+  echo "Feature branch: $FEATURE_BRANCH"
+  echo "Target branches: ${TARGET_BRANCHES[*]}"
+  echo "Repository: $REPO_NAME"
+  echo ""
+fi
+
+# Create temporary clone
+TMP_DIR=$(mktemp -d)
+git clone --no-checkout . "$TMP_DIR" >/dev/null 2>&1
+pushd "$TMP_DIR" >/dev/null
+
+git checkout "$FEATURE_BRANCH" >/dev/null 2>&1
+
+for TARGET in "${TARGET_BRANCHES[@]}"; do
+  echo "Checking merge for $FEATURE_BRANCH → $TARGET..."
+  
+  # Verify target branch exists on remote
+  if ! git ls-remote --exit-code --heads origin "$TARGET" &> /dev/null; then
+    echo "  ✗ Target branch '$TARGET' does not exist on remote. Skipping."
+    echo ""
+    continue
+  fi
+  
+  git fetch origin "$TARGET" >/dev/null 2>&1
+  git checkout -b "tmp-test-$TARGET" "$FEATURE_BRANCH" >/dev/null 2>&1
+
+  # Try merge
+  if git merge --no-commit --no-ff origin/"$TARGET" >/dev/null 2>&1; then
+    echo "  ✓ Clean merge possible for $FEATURE_BRANCH → $TARGET"
+    git merge --abort >/dev/null 2>&1 || true
+    HEAD_BRANCH="$FEATURE_BRANCH"
+  else
+    echo "  ⚠ Conflict detected for $FEATURE_BRANCH → $TARGET"
+    git merge --abort >/dev/null 2>&1 || true
+    
+    # Create environment-specific branch
+    ENV_BRANCH="${FEATURE_BRANCH}-${TARGET}"
+    HEAD_BRANCH="$ENV_BRANCH"
+    
+    if $DRY_RUN; then
+      echo "  → Would create branch $ENV_BRANCH to resolve conflicts"
+    else
+      echo "  → Creating branch $ENV_BRANCH to resolve conflicts..."
+      git checkout -b "$ENV_BRANCH" "$FEATURE_BRANCH" >/dev/null 2>&1
+      
+      # Push the new branch to origin
+      git push origin "$ENV_BRANCH" 2>&1 | grep -v "remote:" || true
+    fi
+  fi
+
+  if $DRY_RUN; then
+    echo "  → Would create PR: $HEAD_BRANCH → $TARGET"
+  else
+    # Create PR via gh
+    if gh pr create \
+      --base "$TARGET" \
+      --head "$HEAD_BRANCH" \
+      --title "$HEAD_BRANCH → $TARGET" \
+      --body "Auto-generated PR from multi-pr script" \
+      --repo "$REPO_NAME" \
+      >/dev/null 2>&1; then
+      echo "  ✓ Created PR: $HEAD_BRANCH → $TARGET"
+    else
+      echo "  ℹ PR might already exist for $HEAD_BRANCH → $TARGET"
+    fi
+  fi
+  
+  # Return to feature branch for next iteration
+  git checkout "$FEATURE_BRANCH" >/dev/null 2>&1
+  echo ""
+done
+
+popd >/dev/null
+
+if $DRY_RUN; then
+  echo "=== DRY RUN COMPLETE (no changes made) ==="
+else
+  echo "All PRs processed. Back on $CURRENT_BRANCH."
+fi
