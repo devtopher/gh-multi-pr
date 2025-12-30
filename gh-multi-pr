@@ -152,6 +152,9 @@ TMP_DIR=$(mktemp -d)
 git clone --no-checkout . "$TMP_DIR" >/dev/null 2>&1
 pushd "$TMP_DIR" >/dev/null
 
+# Set up remote in temporary clone (local clones don't preserve remotes)
+git remote add origin "$REPO_URL" 2>/dev/null || git remote set-url origin "$REPO_URL"
+
 git checkout "$FEATURE_BRANCH" >/dev/null 2>&1
 
 for TARGET in "${TARGET_BRANCHES[@]}"; do
